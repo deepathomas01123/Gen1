@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from dash import Dash, Input, Output, State, MATCH, callback_context, dash_table, dcc, html, no_update
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "Actuals_Data.xlsx")
+DATA_FILE = os.path.join(os.path.dirname(__file__), "Data", "Actuals_Data.xlsx")
 
 
 def load_data_file():
