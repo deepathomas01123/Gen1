@@ -1,5 +1,6 @@
-dash
-pandas
-numpy
-openpyxl
-gunicorn
+dash>=2.16
+pandas>=2.0
+numpy>=1.24
+openpyxl>=3.1
+pyarrow>=14.0
+gunicorn>=21.2
