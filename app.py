@@ -8,15 +8,22 @@ import numpy as np
 import pandas as pd
 from dash import Dash, Input, Output, State, MATCH, callback_context, dash_table, dcc, html, no_update
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "Data", "Actuals_Data.xlsx")
+DATA_FILE_PARQUET = os.path.join(os.path.dirname(__file__), "data", "Actuals_Data.parquet")
+DATA_FILE_XLSX = os.path.join(os.path.dirname(__file__), "data", "Actuals_Data.xlsx")
 
 
 def load_data_file():
-    """Load Actuals_Data.xlsx from the data/ folder at startup."""
+    """Load Actuals_Data at startup. Prefers the Parquet file (fast); falls
+    back to the Excel file if no Parquet file is present yet, so this keeps
+    working even before the conversion script has been run once."""
+    if os.path.exists(DATA_FILE_PARQUET):
+        source_file, reader = DATA_FILE_PARQUET, pd.read_parquet
+    else:
+        source_file, reader = DATA_FILE_XLSX, pd.read_excel
     try:
-        df = pd.read_excel(DATA_FILE)
+        df = reader(source_file)
     except FileNotFoundError:
-        return None, f"Data file not found: {DATA_FILE}", None
+        return None, f"Data file not found: {source_file}", None
     except Exception as exc:
         return None, f"Could not read data file: {exc}", None
     df.columns = df.columns.str.strip()
@@ -32,7 +39,9 @@ def load_data_file():
         "min_date": valid_dates.min().date().isoformat(),
         "max_date": valid_dates.max().date().isoformat(),
     }
-    return df_to_store(df), f"Actuals_Data.xlsx loaded: {len(df):,} rows, {len(df.columns)} columns", meta
+    return (df_to_store(df),
+            f"{os.path.basename(source_file)} loaded: {len(df):,} rows, {len(df.columns)} columns",
+            meta)
 
 
 SPEEDS = [200, 400, 600, 800, 1000]
