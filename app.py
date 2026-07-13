@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 from dash import Dash, Input, Output, State, MATCH, callback_context, dash_table, dcc, html, no_update
 
-DATA_FILE_PARQUET = os.path.join(os.path.dirname(__file__), "Data", "Actuals_Data.parquet")
-DATA_FILE_XLSX = os.path.join(os.path.dirname(__file__), "Data", "Actuals_Data.xlsx")
+DATA_FILE_PARQUET = os.path.join(os.path.dirname(__file__), "data", "Actuals_Data.parquet")
+DATA_FILE_XLSX = os.path.join(os.path.dirname(__file__), "data", "Actuals_Data.xlsx")
 
 
 def load_data_file():
@@ -726,7 +726,7 @@ def compute_coverage(df, yield_pct):
     if yield_pct >= 100:
         mask = pd.Series([True] * len(agg_df), index=agg_df.index)
     selected_df = agg_df[mask]
-    selected_locs = selected_df["Location"].dropna().astype(str).tolist()
+    selected_locs = selected_df["Location"].dropna().astype(str).unique().tolist()
 
     covered_yield = selected_df["Yield Kg"].sum()
     covered_ha = selected_df["Variety Area (ha)"].sum() if "Variety Area (ha)" in selected_df.columns else 0
@@ -740,11 +740,41 @@ def compute_coverage(df, yield_pct):
     display_df = agg_df.rename(columns=rename)
 
     metrics = {
-        "total_locations": len(agg_df), "selected_locations": len(selected_df),
+        "total_locations": agg_df["Location"].dropna().astype(str).nunique(), "selected_locations": len(selected_locs),
         "total_yield": total_yield, "covered_yield": covered_yield, "actual_pct": actual_pct,
         "total_ha": total_ha, "covered_ha": covered_ha, "actual_ha_pct": actual_ha_pct,
     }
     return display_df, selected_locs, metrics
+
+
+def compute_dimension_coverage(df, dimension_col, yield_pct):
+    """
+    Generalised version of compute_coverage's ranking logic for an arbitrary
+    dimension column (Plant / Division / Product Variety / Cropping System /
+    Location). Ranks distinct values of dimension_col by total Yield Kg
+    (descending) and walks the cumulative sum until yield_pct is reached.
+    Returns (ranked_df, selected_values, actual_pct).
+    """
+    if df.empty or dimension_col not in df.columns or "Yield Kg" not in df.columns:
+        return pd.DataFrame(), [], 0.0
+    agg = df.groupby(dimension_col, dropna=False)["Yield Kg"].sum().reset_index()
+    agg = agg.sort_values("Yield Kg", ascending=False).reset_index(drop=True)
+    total = agg["Yield Kg"].sum()
+    if total <= 0:
+        values = agg[dimension_col].dropna().astype(str).tolist()
+        return agg, values, 0.0
+    agg["Contribution %"] = agg["Yield Kg"] / total * 100
+    agg["Cumulative %"] = agg["Contribution %"].cumsum()
+    prev_cumulative = agg["Cumulative %"] - agg["Contribution %"]
+    if yield_pct >= 100:
+        mask = pd.Series([True] * len(agg), index=agg.index)
+    else:
+        mask = prev_cumulative < yield_pct
+    selected = agg[mask]
+    selected_values = selected[dimension_col].dropna().astype(str).tolist()
+    covered = selected["Yield Kg"].sum()
+    actual_pct = (covered / total * 100) if total > 0 else 0.0
+    return agg, selected_values, actual_pct
 
 
 # ── Minimum devices for coverage locations (capacity-aware) ──────────────────
@@ -896,6 +926,77 @@ def compute_min_devices(raw_df, selected_locs, machine_hrs_per_day, speed):
     return peak_machines, breakdown
 
 
+def render_results_panel():
+    return html.Div([
+        html.H2("Harvest Results"),
+        alert("Change sidebar filters freely. Calculations run only when you click Apply Filters & Run.", "info"),
+        html.Button("Apply Filters & Run", id="apply-filters", n_clicks=0, className="primary-button"),
+        html.Div(id="run-status"),
+        html.Div(id="harvest-output"),
+    ])
+
+
+def render_optimiser_panel():
+    return html.Div([
+        html.H2("Block Optimiser & Financial Analysis"),
+        html.Div([
+            numeric_input("Number of Devices", "n-devices", 1, 1, 1),
+            html.Label([
+                html.Span("Group analysis by"),
+                dcc.Dropdown(id="optimiser-group-dim",
+                             options=[{"label": "None (all data)", "value": "None (all data)"},
+                                      {"label": "Plant", "value": "Plant"}],
+                             value="None (all data)", clearable=False),
+            ], className="field-label light"),
+            html.Label([
+                html.Span("Selected groups"),
+                dcc.Dropdown(id="optimiser-selected-groups", options=[], value=[], multi=True,
+                             placeholder="Used when grouping is selected"),
+            ], className="field-label light"),
+            html.Button("Run Optimiser", id="run-optimiser", n_clicks=0, className="primary-button"),
+        ], className="control-panel"),
+        html.Div(id="optimiser-status"),
+        html.Div(id="optimiser-output"),
+    ])
+
+
+def render_coverage_panel():
+    return html.Div([
+        html.H2("Coverage Planning"),
+        alert(
+            "Coverage is calculated within your current date range. Move the slider to rank Plant, "
+            "Division, Variety, Cropping System and Location by yield and select the minimum set needed "
+            "to reach your threshold — every filter above updates live. You can also edit any of those "
+            "filters directly: the slider will snap to show the actual % of yield your manual selection "
+            "covers.",
+            "info",
+        ),
+        html.Div([
+            html.Div([
+                html.Span("Yield Coverage Target", className="coverage-slider-label"),
+                html.Span([
+                    html.Span("Target: ", className="coverage-pct-sublabel"),
+                    html.Span(id="coverage-pct-label", children="100%"),
+                ], className="coverage-pct-badge"),
+                html.Span([
+                    html.Span("Actual: ", className="coverage-pct-sublabel"),
+                    html.Span(id="coverage-actual-pct-label", children="—%"),
+                ], className="coverage-pct-badge actual"),
+            ], className="coverage-slider-row"),
+            dcc.Slider(id="coverage-yield-slider", min=10, max=100, step=5, value=100,
+                       marks={v: f"{v}%" for v in [10, 25, 50, 75, 90, 100]},
+                       tooltip={"always_visible": False}),
+            html.Div([
+                html.Button("✕  Reset to All Locations", id="coverage-reset-btn",
+                            n_clicks=0, className="coverage-reset-btn"),
+                html.Div(id="coverage-applied-status"),
+            ], className="coverage-apply-row"),
+        ], className="coverage-controls"),
+        html.Div(id="coverage-metrics"),
+        html.Div(id="coverage-table-output"),
+    ])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 external_stylesheets = [
@@ -912,8 +1013,6 @@ app.layout = html.Div([
     dcc.Store(id="raw-meta-store"),
     dcc.Store(id="calc-result-store"),
     dcc.Store(id="optimiser-result-store"),
-    dcc.Store(id="coverage-filter-store"),  # ← pushes {locations,plants,divisions,varieties,cropping} to sidebar
-    dcc.Store(id="coverage-params-store"),  # ← tracks params at last Apply click
     html.Div([
         html.Div([
             html.H2("Rubus KPI"),
@@ -954,11 +1053,20 @@ app.layout = html.Div([
                 dcc.Tab(label="Block Optimiser & Financial Analysis", value="tab-optimiser"),
                 dcc.Tab(label="Coverage Planning", value="tab-coverage"),
             ]),
-            html.Div(id="tab-content", className="content-card"),
+            # All three panels are mounted permanently and toggled via CSS
+            # display, rather than being created/destroyed on tab switch.
+            # This keeps every component ID (coverage-yield-slider,
+            # optimiser-group-dim, etc.) present in the DOM at all times, so
+            # callbacks that reference them never hit a "nonexistent object"
+            # error just because a different tab happens to be active.
+            html.Div(id="panel-results", className="content-card", children=render_results_panel()),
+            html.Div(id="panel-optimiser", className="content-card", style={"display": "none"},
+                     children=render_optimiser_panel()),
+            html.Div(id="panel-coverage", className="content-card", style={"display": "none"},
+                     children=render_coverage_panel()),
         ], className="main"),
     ], className="app-shell"),
 ])
-
 
 app.index_string = """
 <!DOCTYPE html>
@@ -1091,7 +1199,9 @@ app.index_string = """
 
             /* ── COVERAGE PLANNING ── */
             .coverage-controls { background: #f0f7f0; border: 1px solid #c6e8d0; border-radius: 12px; padding: 20px 24px; margin-bottom: 20px; }
-            .coverage-slider-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+            .coverage-slider-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 10px; flex-wrap: wrap; }
+            .coverage-pct-sublabel { font-size: 11px; font-weight: 600; opacity: 0.85; text-transform: uppercase; letter-spacing: .04em; }
+            .coverage-pct-badge.actual { background: #245c3f; border: 1px solid #6ee7b7; }
             .coverage-slider-label { font-size: 15px; font-weight: 700; color: #1a4731; }
             .coverage-pct-badge { background: #1a4731; color: #fff; padding: 5px 18px; border-radius: 999px; font-size: 20px; font-weight: 800; letter-spacing: 0.02em; }
             .coverage-apply-row { display: flex; gap: 12px; margin-top: 18px; align-items: center; flex-wrap: wrap; }
@@ -1226,180 +1336,205 @@ def cascade_options(raw_data, start_date, end_date, parent_values):
 
 
 def resolve_filter_value(options, current_value, all_clicks, none_clicks):
-    trigger = callback_context.triggered_id
+    triggered = callback_context.triggered or []
+    triggered_ids = {t["prop_id"].split(".")[0] for t in triggered}
     available = all_values(options)
-    if trigger and str(trigger).endswith("-none"): return []
-    if trigger and str(trigger).endswith("-all"): return available
-    if trigger == "raw-data-store": return available
+    if any(tid.endswith("-none") for tid in triggered_ids): return []
+    if any(tid.endswith("-all") for tid in triggered_ids): return available
+    if "raw-data-store" in triggered_ids: return available
     if current_value is None: return available
     if current_value == []: return []
     kept = [v for v in current_value if v in available]
     return kept if kept else (available if available else [])
 
 
+# ── Single engine owning OPTIONS + VALUE of the slider and all 5 filters ─────
+# This has to be one callback: Dash rejects a callback graph where the slider
+# and a filter each write to something the other reads (a real cross-callback
+# cycle). Within a SINGLE callback, the same component/prop can be both an
+# Input and an Output (a "self-loop"), which is the only Dash-legal way to
+# get true two-way sync between the slider and the filters.
+#
+# Options and value are ALSO combined into this one callback (rather than
+# options living in their own separate callbacks) because splitting them
+# causes a real race: when options and value for the same dropdown are set
+# by two different callbacks, their responses can arrive at the browser out
+# of order. A dropdown that receives its new `value` before its matching
+# `options` will treat those values as invalid, silently clear itself to
+# `[]`, and report that clearing back to the server as a genuine user edit --
+# which then looks identical to a deliberate "None" click and sticks
+# permanently. Returning options and value together in one response makes
+# them atomic, so this can't happen.
+
 @app.callback(
+    Output("coverage-yield-slider", "value"),
     Output("plant-filter", "options"), Output("plant-filter", "value"),
-    Input("raw-data-store", "data"), Input("date-range", "start_date"),
-    Input("date-range", "end_date"), Input("plant-all", "n_clicks"),
-    Input("plant-none", "n_clicks"), Input("coverage-filter-store", "data"),
-    State("plant-filter", "value"), State("tabs", "value"),
-)
-def update_plant_filter(raw_data, start_date, end_date, all_clicks, none_clicks, cov_store, current_value, active_tab):
-    trigger = callback_context.triggered_id
-    df = cascade_options(raw_data, start_date, end_date, {})
-    opts = options_for(df, "Plant")
-    available = all_values(opts)
-    if trigger == "coverage-filter-store" and cov_store is not None and active_tab == "tab-coverage":
-        valid = [v for v in (cov_store.get("plants") or []) if v in available]
-        return opts, (valid if valid else available)
-    return opts, resolve_filter_value(opts, current_value, all_clicks, none_clicks)
-
-
-@app.callback(
     Output("division-filter", "options"), Output("division-filter", "value"),
-    Input("raw-data-store", "data"), Input("date-range", "start_date"),
-    Input("date-range", "end_date"), Input("plant-filter", "value"),
-    Input("division-all", "n_clicks"), Input("division-none", "n_clicks"),
-    Input("coverage-filter-store", "data"),
-    State("division-filter", "value"), State("tabs", "value"),
-)
-def update_division_filter(raw_data, start_date, end_date, plants, all_clicks, none_clicks, cov_store, current_value, active_tab):
-    trigger = callback_context.triggered_id
-    df = cascade_options(raw_data, start_date, end_date, {"Plant": plants or []})
-    opts = options_for(df, "Division")
-    available = all_values(opts)
-    if trigger == "coverage-filter-store" and cov_store is not None and active_tab == "tab-coverage":
-        valid = [v for v in (cov_store.get("divisions") or []) if v in available]
-        return opts, (valid if valid else available)
-    return opts, resolve_filter_value(opts, current_value, all_clicks, none_clicks)
-
-
-@app.callback(
-    Output("location-filter", "options"), Output("location-filter", "value"),
-    Input("raw-data-store", "data"), Input("date-range", "start_date"),
-    Input("date-range", "end_date"), Input("plant-filter", "value"),
-    Input("division-filter", "value"), Input("location-all", "n_clicks"),
-    Input("location-none", "n_clicks"), Input("coverage-filter-store", "data"),
-    State("location-filter", "value"), State("tabs", "value"),
-)
-def update_location_filter(raw_data, start_date, end_date, plants, divisions,
-                           all_clicks, none_clicks, cov_store, current_value, active_tab):
-    trigger = callback_context.triggered_id
-    df = cascade_options(raw_data, start_date, end_date, {"Plant": plants or [], "Division": divisions or []})
-    opts = options_for(df, "Location")
-    available = all_values(opts)
-    if trigger == "coverage-filter-store" and cov_store is not None and active_tab == "tab-coverage":
-        valid = [v for v in (cov_store.get("locations") or []) if v in available]
-        return opts, (valid if valid else available)
-    return opts, resolve_filter_value(opts, current_value, all_clicks, none_clicks)
-
-
-@app.callback(
     Output("variety-filter", "options"), Output("variety-filter", "value"),
-    Input("raw-data-store", "data"), Input("date-range", "start_date"),
-    Input("date-range", "end_date"), Input("plant-filter", "value"),
-    Input("division-filter", "value"), Input("location-filter", "value"),
+    Output("cropping-filter", "options"), Output("cropping-filter", "value"),
+    Output("location-filter", "options"), Output("location-filter", "value"),
+    Output("coverage-applied-status", "children"),
+    Input("coverage-yield-slider", "value"),
+    Input("plant-filter", "value"),
+    Input("division-filter", "value"),
+    Input("variety-filter", "value"),
+    Input("cropping-filter", "value"),
+    Input("location-filter", "value"),
+    Input("plant-all", "n_clicks"), Input("plant-none", "n_clicks"),
+    Input("division-all", "n_clicks"), Input("division-none", "n_clicks"),
     Input("variety-all", "n_clicks"), Input("variety-none", "n_clicks"),
-    Input("coverage-filter-store", "data"),
-    State("variety-filter", "value"), State("tabs", "value"),
+    Input("cropping-all", "n_clicks"), Input("cropping-none", "n_clicks"),
+    Input("location-all", "n_clicks"), Input("location-none", "n_clicks"),
+    Input("coverage-reset-btn", "n_clicks"),
+    Input("raw-data-store", "data"),
+    Input("date-range", "start_date"), Input("date-range", "end_date"),
+    State("tabs", "value"),
+    prevent_initial_call=True,
 )
-def update_variety_filter(raw_data, start_date, end_date, plants, divisions, locations,
-                          all_clicks, none_clicks, cov_store, current_value, active_tab):
-    trigger = callback_context.triggered_id
-    df = cascade_options(raw_data, start_date, end_date,
-                         {"Plant": plants or [], "Division": divisions or [], "Location": locations or []})
-    opts = options_for(df, "Product Variety")
-    available = all_values(opts)
-    if trigger == "coverage-filter-store" and cov_store is not None and active_tab == "tab-coverage":
-        valid = [v for v in (cov_store.get("varieties") or []) if v in available]
-        return opts, (valid if valid else available)
-    return opts, resolve_filter_value(opts, current_value, all_clicks, none_clicks)
+def filter_and_coverage_engine(slider_val, plant_val, division_val, variety_val, cropping_val, location_val,
+                               plant_all_c, plant_none_c, division_all_c, division_none_c,
+                               variety_all_c, variety_none_c, cropping_all_c, cropping_none_c,
+                               location_all_c, location_none_c, reset_clicks,
+                               raw_data, start_date, end_date, active_tab):
+    triggered_ids = {t["prop_id"].split(".")[0] for t in (callback_context.triggered or [])}
+    NU = no_update
+
+    def opts(col, restrict):
+        return options_for(cascade_options(raw_data, start_date, end_date, restrict), col)
+
+    if "coverage-reset-btn" in triggered_ids:
+        p_opts = opts("Plant", {}); p_val = all_values(p_opts)
+        d_opts = opts("Division", {}); d_val = all_values(d_opts)
+        v_opts = opts("Product Variety", {}); v_val = all_values(v_opts)
+        c_opts = opts("Cropping System", {}); c_val = all_values(c_opts)
+        l_opts = opts("Location", {}); l_val = all_values(l_opts)
+        banner = alert("Reset — slider and all filters restored to full coverage.", "info")
+        return (100, p_opts, p_val, d_opts, d_val, v_opts, v_val, c_opts, c_val, l_opts, l_val, banner)
+
+    if not raw_data:
+        return (NU, NU, NU, NU, NU, NU, NU, NU, NU, NU, NU, NU)
+
+    # ---- Ordinary cascade / All / None / kept-selection behaviour, exactly
+    # as before, applied on every tab (Harvest Results / Optimiser both rely
+    # on this too, since the sidebar filters are shared across tabs). ----
+    plant_opts = opts("Plant", {})
+    plant_resolved = resolve_filter_value(plant_opts, plant_val, plant_all_c, plant_none_c)
+
+    division_opts = opts("Division", {"Plant": plant_resolved})
+    division_resolved = resolve_filter_value(division_opts, division_val, division_all_c, division_none_c)
+
+    variety_opts = opts("Product Variety", {"Plant": plant_resolved, "Division": division_resolved})
+    variety_resolved = resolve_filter_value(variety_opts, variety_val, variety_all_c, variety_none_c)
+
+    cropping_opts = opts("Cropping System",
+                         {"Plant": plant_resolved, "Division": division_resolved, "Product Variety": variety_resolved})
+    cropping_resolved = resolve_filter_value(cropping_opts, cropping_val, cropping_all_c, cropping_none_c)
+
+    location_opts = opts("Location", {"Plant": plant_resolved, "Division": division_resolved})
+    location_resolved = resolve_filter_value(location_opts, location_val, location_all_c, location_none_c)
+
+    if active_tab != "tab-coverage":
+        return (NU, plant_opts, plant_resolved, division_opts, division_resolved,
+                variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+                location_opts, location_resolved, NU)
+
+    # ---- On the Coverage tab: layer the yield-based engine on top ----
+    df = df_from_store(raw_data)
+    if df.empty:
+        return (NU, plant_opts, plant_resolved, division_opts, division_resolved,
+                variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+                location_opts, location_resolved, alert("Upload a dataset to use Coverage Planning.", "info"))
+    if start_date and end_date:
+        df = df[(df["Pick Date"].dt.date >= pd.to_datetime(start_date).date())
+                & (df["Pick Date"].dt.date <= pd.to_datetime(end_date).date())]
+
+    # 1) Slider dragged -> rank Locations against the FULL universe, then
+    #    derive which Plant/Division/Variety/Cropping values are present
+    #    among the winning locations. (Ranking each dimension separately at
+    #    the same % compounds -- 60% at every stage nets ~50% overall -- so
+    #    we deliberately don't do that.)
+    if "coverage-yield-slider" in triggered_ids:
+        target = slider_val if slider_val is not None else 100
+        _, selected_locs, actual = compute_dimension_coverage(df, "Location", target)
+        subset = df[df["Location"].astype(str).isin(selected_locs)]
+        new_plants = sorted(subset["Plant"].dropna().astype(str).unique().tolist())
+        new_divisions = sorted(subset["Division"].dropna().astype(str).unique().tolist())
+        new_varieties = sorted(subset["Product Variety"].dropna().astype(str).unique().tolist())
+        new_croppings = sorted(subset["Cropping System"].dropna().astype(str).unique().tolist())
+
+        p_opts2 = opts("Plant", {})
+        d_opts2 = opts("Division", {"Plant": new_plants})
+        v_opts2 = opts("Product Variety", {"Plant": new_plants, "Division": new_divisions})
+        c_opts2 = opts("Cropping System",
+                       {"Plant": new_plants, "Division": new_divisions, "Product Variety": new_varieties})
+        l_opts2 = opts("Location", {"Plant": new_plants, "Division": new_divisions})
+
+        banner = html.Div(f"✓  {len(selected_locs)} location(s) covering {actual:.1f}% of yield — "
+                          f"Plant / Division / Variety / Cropping filters updated to match.",
+                          className="coverage-applied-banner")
+        return (NU, p_opts2, new_plants, d_opts2, new_divisions, v_opts2, new_varieties,
+                c_opts2, new_croppings, l_opts2, selected_locs, banner)
+
+    # 2) Location edited manually -> respect the exact pick, just snap the
+    #    slider to whatever % it actually achieves.
+    if triggered_ids & {"location-filter", "location-all", "location-none"}:
+        universe_selections = {"Plant": plant_resolved, "Division": division_resolved,
+                               "Product Variety": variety_resolved, "Cropping System": cropping_resolved}
+        universe = apply_filters(df, None, None, universe_selections)
+        total = universe["Yield Kg"].sum() if "Yield Kg" in universe.columns else 0
+        covered = universe[universe["Location"].astype(str).isin(location_resolved)]["Yield Kg"].sum() \
+            if "Yield Kg" in universe.columns else 0
+        new_target = round((covered / total * 100) if total else 0, 1)
+        banner = html.Div(f"✓  Slider synced to {new_target:.1f}% based on your Location selection.",
+                          className="coverage-applied-banner")
+        return (new_target, plant_opts, plant_resolved, division_opts, division_resolved,
+                variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+                location_opts, location_resolved, banner)
+
+    # 3) Plant / Division / Variety / Cropping edited manually (or raw data /
+    #    date range changed) -> rank Locations within that narrower universe
+    #    at the current slider target (as before), then snap the slider to
+    #    the actual % achieved.
+    universe_selections = {"Plant": plant_resolved, "Division": division_resolved,
+                           "Product Variety": variety_resolved, "Cropping System": cropping_resolved}
+    universe = apply_filters(df, None, None, universe_selections)
+    if universe.empty:
+        banner = alert("No data matches current filters (excluding Location).", "warning")
+        return (NU, plant_opts, plant_resolved, division_opts, division_resolved,
+                variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+                location_opts, location_resolved, banner)
+
+    target = slider_val if slider_val is not None else 100
+    _, ranked_locs, metrics = compute_coverage(universe, target)
+    if not ranked_locs:
+        banner = alert("No locations qualify at this threshold.", "warning")
+        return (NU, plant_opts, plant_resolved, division_opts, division_resolved,
+                variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+                location_opts, location_resolved, banner)
+
+    actual_pct = round(metrics["actual_pct"], 1)
+    banner = html.Div(f"✓  {metrics['selected_locations']} location(s) covering {actual_pct:.1f}% of yield — "
+                      f"Location filter and slider updated.", className="coverage-applied-banner")
+    return (actual_pct, plant_opts, plant_resolved, division_opts, division_resolved,
+            variety_opts, variety_resolved, cropping_opts, cropping_resolved,
+            location_opts, ranked_locs, banner)
+
 
 
 @app.callback(
-    Output("cropping-filter", "options"), Output("cropping-filter", "value"),
-    Input("raw-data-store", "data"), Input("date-range", "start_date"),
-    Input("date-range", "end_date"), Input("plant-filter", "value"),
-    Input("division-filter", "value"), Input("location-filter", "value"),
-    Input("variety-filter", "value"), Input("cropping-all", "n_clicks"),
-    Input("cropping-none", "n_clicks"), Input("coverage-filter-store", "data"),
-    State("cropping-filter", "value"), State("tabs", "value"),
+    Output("panel-results", "style"),
+    Output("panel-optimiser", "style"),
+    Output("panel-coverage", "style"),
+    Input("tabs", "value"),
 )
-def update_cropping_filter(raw_data, start_date, end_date, plants, divisions, locations,
-                           varieties, all_clicks, none_clicks, cov_store, current_value, active_tab):
-    trigger = callback_context.triggered_id
-    df = cascade_options(raw_data, start_date, end_date,
-                         {"Plant": plants or [], "Division": divisions or [],
-                          "Location": locations or [], "Product Variety": varieties or []})
-    opts = options_for(df, "Cropping System")
-    available = all_values(opts)
-    if trigger == "coverage-filter-store" and cov_store is not None and active_tab == "tab-coverage":
-        valid = [v for v in (cov_store.get("cropping_systems") or []) if v in available]
-        return opts, (valid if valid else available)
-    return opts, resolve_filter_value(opts, current_value, all_clicks, none_clicks)
-
-
-@app.callback(Output("tab-content", "children"), Input("tabs", "value"))
-def render_tab(tab):
-    if tab == "tab-coverage":
-        return html.Div([
-            html.H2("Coverage Planning"),
-            alert(
-                "Coverage is calculated across the full date-filtered dataset — sidebar dimension filters are intentionally ignored here. "
-                "Locations are ranked from highest to lowest yield and the minimum set needed to reach your threshold is selected. "
-                "Click Apply to push qualifying locations (and their Plants, Divisions, Varieties) into the sidebar filters.",
-                "info",
-            ),
-            html.Div([
-                html.Div([
-                    html.Span("Yield Coverage Target", className="coverage-slider-label"),
-                    html.Span(id="coverage-pct-label", className="coverage-pct-badge", children="100%"),
-                ], className="coverage-slider-row"),
-                dcc.Slider(id="coverage-yield-slider", min=10, max=100, step=5, value=100,
-                           marks={v: f"{v}%" for v in [10, 25, 50, 75, 90, 100]},
-                           tooltip={"always_visible": False}),
-                html.Div([
-                    html.Button("▶  Apply to Location Filter", id="coverage-apply-btn",
-                                n_clicks=0, className="coverage-apply-btn"),
-                    html.Button("✕  Reset Filter", id="coverage-reset-btn",
-                                n_clicks=0, className="coverage-reset-btn"),
-                    html.Div(id="coverage-applied-status"),
-                ], className="coverage-apply-row"),
-            ], className="coverage-controls"),
-            html.Div(id="coverage-metrics"),
-            html.Div(id="coverage-table-output"),
-        ])
-
-    if tab == "tab-optimiser":
-        return html.Div([
-            html.H2("Block Optimiser & Financial Analysis"),
-            html.Div([
-                numeric_input("Number of Devices", "n-devices", 1, 1, 1),
-                html.Label([
-                    html.Span("Group analysis by"),
-                    dcc.Dropdown(id="optimiser-group-dim",
-                                 options=[{"label": "None (all data)", "value": "None (all data)"},
-                                          {"label": "Plant", "value": "Plant"}],
-                                 value="None (all data)", clearable=False),
-                ], className="field-label light"),
-                html.Label([
-                    html.Span("Selected groups"),
-                    dcc.Dropdown(id="optimiser-selected-groups", options=[], value=[], multi=True,
-                                 placeholder="Used when grouping is selected"),
-                ], className="field-label light"),
-                html.Button("Run Optimiser", id="run-optimiser", n_clicks=0, className="primary-button"),
-            ], className="control-panel"),
-            html.Div(id="optimiser-status"),
-            html.Div(id="optimiser-output"),
-        ])
-
-    return html.Div([
-        html.H2("Harvest Results"),
-        alert("Change sidebar filters freely. Calculations run only when you click Apply Filters & Run.", "info"),
-        html.Button("Apply Filters & Run", id="apply-filters", n_clicks=0, className="primary-button"),
-        html.Div(id="run-status"),
-        html.Div(id="harvest-output"),
-    ])
+def toggle_tab_panels(tab):
+    shown = {"display": "block"}
+    hidden = {"display": "none"}
+    return (
+        shown if tab == "tab-results" else hidden,
+        shown if tab == "tab-optimiser" else hidden,
+        shown if tab == "tab-coverage" else hidden,
+    )
 
 
 # ── Coverage: live badge ──────────────────────────────────────────────────────
@@ -1408,42 +1543,89 @@ def update_coverage_label(val):
     return f"{val}%"
 
 
-# ── Coverage: live table (only respects date range — all dimension filters ignored) ────
+# ── Coverage: metrics + table — reads the Location filter back ("vice versa") ─
 @app.callback(
     Output("coverage-metrics", "children"),
     Output("coverage-table-output", "children"),
+    Output("coverage-actual-pct-label", "children"),
     Input("coverage-yield-slider", "value"),
     Input("raw-data-store", "data"),
     Input("date-range", "start_date"),
     Input("date-range", "end_date"),
+    Input("plant-filter", "value"),
+    Input("division-filter", "value"),
+    Input("variety-filter", "value"),
+    Input("cropping-filter", "value"),
+    Input("location-filter", "value"),
     Input("calc-result-store", "data"),
     Input("machine-hours", "value"),
     Input("speed-range", "value"),
-    Input("coverage-params-store", "data"),
 )
-def update_coverage_table(yield_pct, raw_data, start_date, end_date, calc_payload,
-                          machine_hours, speed_range, params_snapshot):
+def update_coverage_table(yield_pct, raw_data, start_date, end_date,
+                          plants, divisions, varieties, cropping_systems, locations,
+                          calc_payload, machine_hours, speed_range):
     if not raw_data:
-        return alert("Upload a dataset to use Coverage Planning.", "info"), html.Div()
+        return alert("Upload a dataset to use Coverage Planning.", "info"), html.Div(), "—%"
 
     df = df_from_store(raw_data)
-    # Coverage ignores ALL dimension filters — only date range applies.
-    # This ensures the universe (denominator) is always the full dataset,
-    # so 100% always means all locations regardless of sidebar state.
-    df_filtered = apply_filters(df, start_date, end_date, {})
+    # Same universe as the sync callback: everything except Location. None
+    # means "not resolved yet" (no restriction); [] means the user
+    # deliberately picked nothing (zero rows) -- these must not be conflated.
+    universe_selections = {}
+    if plants is not None: universe_selections["Plant"] = plants
+    if divisions is not None: universe_selections["Division"] = divisions
+    if varieties is not None: universe_selections["Product Variety"] = varieties
+    if cropping_systems is not None: universe_selections["Cropping System"] = cropping_systems
+    df_filtered = apply_filters(df, start_date, end_date, universe_selections)
 
     if df_filtered.empty:
-        return alert("No data matches current filters (excluding Location).", "warning"), html.Div()
+        return alert("No data matches current filters (excluding Location).", "warning"), html.Div(), "—%"
 
-    display_df, selected_locs, metrics = compute_coverage(df_filtered, yield_pct)
-
+    display_df, ranked_locs, metrics = compute_coverage(df_filtered, yield_pct)
     if display_df.empty:
-        return alert("Could not compute coverage — check Location and Yield Kg columns exist.", "warning"), html.Div()
+        return alert("Could not compute coverage — check Location and Yield Kg columns exist.", "warning"), html.Div(), "—%"
 
-    n_sel = metrics["selected_locations"]
-    n_tot = metrics["total_locations"]
+    # "vice versa": use whatever's actually selected in the Location filter
+    # right now, intersected with what's available in the current universe.
+    available_locs = set(display_df["Location"].astype(str))
+    if locations:
+        selected_locs = [l for l in locations if str(l) in available_locs]
+        if not selected_locs:
+            # Location filter cleared everything within this universe — fall
+            # back to the slider's own ranking so the page isn't just empty.
+            selected_locs = ranked_locs
+    else:
+        selected_locs = ranked_locs
 
-    # ── Machines required (capacity-aware) ───────────────────────────────────
+    covered_yield = display_df[display_df["Location"].astype(str).isin(selected_locs)]["Yield Kg"].sum()
+    total_yield = metrics["total_yield"]
+    covered_ha = display_df[display_df["Location"].astype(str).isin(selected_locs)]["Total Ha"].sum() \
+        if "Total Ha" in display_df.columns else 0
+    total_ha = metrics["total_ha"]
+    actual_pct = (covered_yield / total_yield * 100) if total_yield > 0 else 0
+    actual_ha_pct = (covered_ha / total_ha * 100) if total_ha > 0 else 0
+    n_sel, n_tot = len(selected_locs), metrics["total_locations"]
+
+    # How many locations exist in the FULL dataset (date-range only, before
+    # Plant/Division/Variety/Cropping narrow things down) -- this is what
+    # lets us say "14 of 160 total locations match your current filters"
+    # instead of leaving people to wonder why a small coverage set is being
+    # measured against a small denominator.
+    dataset_df = df
+    if start_date and end_date:
+        dataset_df = dataset_df[(dataset_df["Pick Date"].dt.date >= pd.to_datetime(start_date).date())
+                                 & (dataset_df["Pick Date"].dt.date <= pd.to_datetime(end_date).date())]
+    total_dataset_locations = dataset_df["Location"].dropna().astype(str).nunique() \
+        if "Location" in dataset_df.columns else n_tot
+    scope_banner = None
+    if total_dataset_locations > n_tot:
+        scope_banner = html.Div(
+            f"ℹ️  Your Plant / Division / Variety / Cropping filters narrow the dataset to {n_tot} of "
+            f"{total_dataset_locations} total locations — the numbers below are all relative to that {n_tot}.",
+            className="alert alert-info", style={"marginBottom": "12px"},
+        )
+
+    # ── Machines required (capacity-aware) — against the actual selection ────
     try:
         mhpd = float(str(machine_hours).strip()) if machine_hours not in (None, "", "None") else 8.0
     except Exception:
@@ -1452,15 +1634,10 @@ def update_coverage_table(yield_pct, raw_data, start_date, end_date, calc_payloa
     mid_speed = (speed_range[0] + speed_range[1]) / 2
 
     if "Variety Area (ha)" in df_filtered.columns:
-        min_devices, device_breakdown = compute_min_devices(
-            df_filtered, selected_locs, mhpd, mid_speed
-        )
+        min_devices, device_breakdown = compute_min_devices(df_filtered, selected_locs, mhpd, mid_speed)
     elif calc_payload:
-        # fallback: use calc_df if raw data lacks ha column
         calc_df = df_from_store(calc_payload["df"])
-        min_devices, device_breakdown = compute_min_devices(
-            calc_df, selected_locs, mhpd, mid_speed
-        )
+        min_devices, device_breakdown = compute_min_devices(calc_df, selected_locs, mhpd, mid_speed)
     else:
         min_devices, device_breakdown = None, []
 
@@ -1473,34 +1650,20 @@ def update_coverage_table(yield_pct, raw_data, start_date, end_date, calc_payloa
         machines_sub = "upload dataset with Variety Area (ha)"
         machines_highlight = False
 
-    # ── Stale warning — shown if params differ from last Apply ───────────────
-    stale_warning = html.Div()
-    if params_snapshot:
-        current_params = {
-            "yield_pct": yield_pct,
-            "start_date": str(start_date),
-            "end_date": str(end_date),
-        }
-        if current_params != params_snapshot:
-            stale_warning = alert(
-                "⚠️ Inputs have changed since last Apply. "
-                "Click 'Apply to Location Filter' to push updated locations to the sidebar.",
-                "warning",
-            )
-
     metrics_row = html.Div([
-        metric_card("Locations Selected", f"{n_sel} / {n_tot}", f"{yield_pct}% yield target", highlight=True),
-        metric_card("Yield Covered", f"{metrics['actual_pct']:.1f}%",
-                    f"{metrics['covered_yield']:,.0f} of {metrics['total_yield']:,.0f} kg", highlight=True),
-        metric_card("Ha Covered", f"{metrics['actual_ha_pct']:.1f}%",
-                    f"{metrics['covered_ha']:,.1f} of {metrics['total_ha']:,.1f} ha"),
-        metric_card("Locations Excluded", str(n_tot - n_sel), "below yield threshold"),
+        metric_card("Locations Selected", f"{n_sel} / {n_tot}",
+                    f"{yield_pct}% target of the {n_tot}-location filtered universe", highlight=True),
+        metric_card("Yield Covered", f"{actual_pct:.1f}%",
+                    f"{covered_yield:,.0f} of {total_yield:,.0f} kg", highlight=True),
+        metric_card("Ha Covered", f"{actual_ha_pct:.1f}%",
+                    f"{covered_ha:,.1f} of {total_ha:,.1f} ha"),
+        metric_card("Locations Excluded", str(n_tot - n_sel), "below threshold or manually deselected"),
         metric_card("Min. Machines Required", machines_value, machines_sub, highlight=machines_highlight),
     ], className="metric-grid five", style={"marginBottom": "16px"})
 
-    # Build table with In Coverage marker
+    # Build table with In Coverage marker (reflects actual Location filter selection)
     display_df2 = display_df.copy()
-    in_mask = display_df2["Location"].astype(str).isin([str(l) for l in selected_locs])
+    in_mask = display_df2["Location"].astype(str).isin(selected_locs)
     display_df2["In Coverage"] = in_mask.map({True: "✓ Selected", False: "— Excluded"})
 
     cols = list(display_df2.columns)
@@ -1563,65 +1726,9 @@ def update_coverage_table(yield_pct, raw_data, start_date, end_date, calc_payloa
     else:
         breakdown_section = html.Div()
 
-    return metrics_row, html.Div([stale_warning, tags_section, breakdown_section, html.H3("Location Yield Ranking"), table])
-
-
-# ── Coverage: Apply / Reset ───────────────────────────────────────────────────
-@app.callback(
-    Output("coverage-filter-store", "data"),
-    Output("coverage-applied-status", "children"),
-    Output("coverage-params-store", "data"),
-    Input("coverage-apply-btn", "n_clicks"),
-    Input("coverage-reset-btn", "n_clicks"),
-    State("coverage-yield-slider", "value"),
-    State("raw-data-store", "data"),
-    State("date-range", "start_date"),
-    State("date-range", "end_date"),
-    prevent_initial_call=True,
-)
-def apply_or_reset_coverage(apply_clicks, reset_clicks, yield_pct, raw_data,
-                             start_date, end_date):
-    trigger = callback_context.triggered_id
-    if trigger == "coverage-reset-btn":
-        return None, html.Div("Sidebar filters reset — all values restored.", className="alert alert-info", style={"marginTop": "0"}), None
-    if not raw_data:
-        return no_update, alert("Upload a dataset first.", "warning"), no_update
-    df = df_from_store(raw_data)
-    df_filtered = apply_filters(df, start_date, end_date, {})
-    _, selected_locs, metrics = compute_coverage(df_filtered, yield_pct)
-    if not selected_locs:
-        return no_update, alert("No locations selected — adjust the threshold.", "warning"), no_update
-
-    selected_rows = df_filtered[df_filtered["Location"].astype(str).isin(selected_locs)]
-    def unique_vals(col):
-        if col not in selected_rows.columns: return []
-        return sorted(selected_rows[col].dropna().astype(str).unique().tolist())
-
-    cov_store = {
-        "locations": selected_locs,
-        "plants": unique_vals("Plant"),
-        "divisions": unique_vals("Division"),
-        "varieties": unique_vals("Product Variety"),
-        "cropping_systems": unique_vals("Cropping System"),
-    }
-
-    params_snapshot = {
-        "yield_pct": yield_pct,
-        "start_date": str(start_date),
-        "end_date": str(end_date),
-    }
-
-    n_plants = len(cov_store["plants"])
-    n_div = len(cov_store["divisions"])
-    banner = html.Div([
-        html.Span("✓  "),
-        html.Span(
-            f"{metrics['selected_locations']} location(s) covering {metrics['actual_pct']:.1f}% of yield. "
-            f"Sidebar updated: {n_plants} plant(s), {n_div} division(s), "
-            f"{metrics['selected_locations']} location(s), {len(cov_store['varieties'])} variet(ies)."
-        ),
-    ], className="coverage-applied-banner")
-    return cov_store, banner, params_snapshot
+    return (html.Div([scope_banner, metrics_row]) if scope_banner else metrics_row,
+            html.Div([tags_section, breakdown_section, html.H3("Location Yield Ranking"), table]),
+            f"{actual_pct:.0f}%")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
